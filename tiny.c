@@ -9,15 +9,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sendfile.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
+
+
+
+#ifdef __APPLE__
+#include <sys/uio.h>
+#else
+#include <sys/sendfile.h>
+DIR *fdopendir(int fd);
+int openat(int dirfd, const char *pathname, int flags);
+#endif
 
 #define LISTENQ  1024  /* second argument to listen() */
 #define MAXLINE 1024   /* max length of a line */
 #define RIO_BUFSIZE 1024
+
 
 typedef struct {
     int rio_fd;                 /* descriptor for this buf */
@@ -31,8 +41,8 @@ typedef struct sockaddr SA;
 
 typedef struct {
     char filename[512];
-    off_t offset;              /* for support Range */
-    size_t end;
+    uint32_t offset;              /* for support Range */
+    uint32_t end;
 } http_request;
 
 typedef struct {
@@ -147,9 +157,9 @@ void format_size(char* buf, struct stat *stat){
     if(S_ISDIR(stat->st_mode)){
         sprintf(buf, "%s", "[DIR]");
     } else {
-        off_t size = stat->st_size;
+        uint32_t size = stat->st_size;
         if(size < 1024){
-            sprintf(buf, "%lu", size);
+            sprintf(buf, "%u", size);
         } else if (size < 1024 * 1024){
             sprintf(buf, "%.1fK", (double)size / 1024);
         } else if (size < 1024 * 1024 * 1024){
@@ -226,11 +236,13 @@ int open_listenfd(int port){
                    (const void *)&optval , sizeof(int)) < 0)
         return -1;
 
+#ifndef __APPLE__
     // 6 is TCP's protocol number
     // enable this, much faster : 4000 req/s -> 17000 req/s
     if (setsockopt(listenfd, 6, TCP_CORK,
                    (const void *)&optval , sizeof(int)) < 0)
         return -1;
+#endif
 
     /* Listenfd will be an endpoint for all requests to port
        on any IP address for this host */
@@ -275,7 +287,7 @@ void parse_request(int fd, http_request *req){
     while(buf[0] != '\n' && buf[1] != '\n') { /* \n || \r\n */
         rio_readlineb(&rio, buf, MAXLINE);
         if(buf[0] == 'R' && buf[1] == 'a' && buf[2] == 'n'){
-            sscanf(buf, "Range: bytes=%lu-%lu", &req->offset, &req->end);
+            sscanf(buf, "Range: bytes=%u-%u", &req->offset, &req->end);
             // Range: [start, end]
             if( req->end != 0) req->end ++;
         }
@@ -314,11 +326,11 @@ void client_error(int fd, int status, char *msg, char *longmsg){
 }
 
 void serve_static(int out_fd, int in_fd, http_request *req,
-                  size_t total_size){
+                  uint32_t total_size){
     char buf[256];
     if (req->offset > 0){
         sprintf(buf, "HTTP/1.1 206 Partial\r\n");
-        sprintf(buf + strlen(buf), "Content-Range: bytes %lu-%lu/%lu\r\n",
+        sprintf(buf + strlen(buf), "Content-Range: bytes %u-%u/%u\r\n",
                 req->offset, req->end, total_size);
     } else {
         sprintf(buf, "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\n");
@@ -326,18 +338,26 @@ void serve_static(int out_fd, int in_fd, http_request *req,
     sprintf(buf + strlen(buf), "Cache-Control: no-cache\r\n");
     // sprintf(buf + strlen(buf), "Cache-Control: public, max-age=315360000\r\nExpires: Thu, 31 Dec 2037 23:55:55 GMT\r\n");
 
-    sprintf(buf + strlen(buf), "Content-length: %lu\r\n",
+    sprintf(buf + strlen(buf), "Content-length: %u\r\n",
             req->end - req->offset);
     sprintf(buf + strlen(buf), "Content-type: %s\r\n\r\n",
             get_mime_type(req->filename));
 
     writen(out_fd, buf, strlen(buf));
+	printf("before sending file offset=%u end=%u\n",req->offset,req->end);
     off_t offset = req->offset; /* copy */
     while(offset < req->end){
-        if(sendfile(out_fd, in_fd, &offset, req->end - req->offset) <= 0) {
+		off_t sendlen=req->end - req->offset;
+#ifdef __APPLE__
+		if(sendfile(in_fd, out_fd, offset, &sendlen , NULL, 0)<0)
+#else
+        if(sendfile(out_fd, in_fd, &offset, sendlen) <= 0) 
+#endif
+		{
+			perror("sendfile");
             break;
         }
-        printf("offset: %d \n\n", offset);
+        //printf("offset: %d \n\n", offset);
         close(out_fd);
         break;
     }
@@ -415,26 +435,10 @@ int main(int argc, char** argv){
     // won't kill the whole process.
     signal(SIGPIPE, SIG_IGN);
 
-    for(int i = 0; i < 10; i++) {
-        int pid = fork();
-        if (pid == 0) {         //  child
-            while(1){
-                connfd = accept(listenfd, (SA *)&clientaddr, &clientlen);
-                process(connfd, &clientaddr);
-                close(connfd);
-            }
-        } else if (pid > 0) {   //  parent
-            printf("child pid is %d\n", pid);
-        } else {
-            perror("fork");
-        }
-    }
-
-    while(1){
-        connfd = accept(listenfd, (SA *)&clientaddr, &clientlen);
-        process(connfd, &clientaddr);
-        close(connfd);
-    }
-
+	while(1){
+		connfd = accept(listenfd, (SA *)&clientaddr, &clientlen);
+		process(connfd, &clientaddr);
+		close(connfd);
+	}
     return 0;
 }
