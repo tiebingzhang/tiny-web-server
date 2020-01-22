@@ -14,13 +14,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-
+#define SORT_DIR 
+//to enable debug, define dprintf to printf
 #define dprintf 
 
 #ifdef __APPLE__
-#include <sys/uio.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include "tunprintf.h"
+#else
+#define tunprintf printf
+#endif
 #pragma clang diagnostic ignored "-Wunused-value"
 #else
+#define tunprintf printf
 #include <sys/sendfile.h>
 DIR *fdopendir(int fd);
 int openat(int dirfd, const char *pathname, int flags);
@@ -29,7 +36,6 @@ int openat(int dirfd, const char *pathname, int flags);
 #define LISTENQ  1024  /* second argument to listen() */
 #define MAXLINE 1024   /* max length of a line */
 #define RIO_BUFSIZE 1024
-
 
 typedef struct {
     int rio_fd;                 /* descriptor for this buf */
@@ -172,6 +178,26 @@ void format_size(char* buf, struct stat *stat){
     }
 }
 
+#ifdef SORT_DIR
+
+#define FILELIST_MAX	128
+#define NAMELEN_MAX		320
+struct filelist_t{
+    char name[NAMELEN_MAX];
+    char timestamp[24];
+    char size[24];
+} filelist[FILELIST_MAX];
+static int filelist_count=0;
+
+int filelist_compare (const void * a, const void * b) {
+  struct filelist_t *filelistA = (struct filelist_t *)a;
+  struct filelist_t *filelistB = (struct filelist_t *)b;
+
+  return (strcmp(filelistB->name , filelistA->name));
+}
+
+#endif
+
 void handle_directory_request(int out_fd, int dir_fd, char *filename){
     char buf[MAXLINE], m_time[32], size[16];
     struct stat statbuf;
@@ -205,12 +231,32 @@ void handle_directory_request(int out_fd, int dir_fd, char *filename){
         format_size(size, &statbuf);
         if(S_ISREG(statbuf.st_mode) || S_ISDIR(statbuf.st_mode)){
             char *d = S_ISDIR(statbuf.st_mode) ? "/" : "";
+#ifdef SORT_DIR
+			snprintf(filelist[filelist_count].name,sizeof(filelist[filelist_count].name),"%s%s",dp->d_name,d);
+			snprintf(filelist[filelist_count].timestamp,sizeof(filelist[filelist_count].timestamp),"%s",m_time);
+			snprintf(filelist[filelist_count].size,sizeof(filelist[filelist_count].size),"%s",size);
+			filelist_count++;
+			if (filelist_count>=FILELIST_MAX){
+				break;
+			}
+#else
             sprintf(buf, "<tr><td><a href=\"%s%s\">%s%s</a></td><td>%s</td><td>%s</td></tr>\n",
                     dp->d_name, d, dp->d_name, d, m_time, size);
             writen(out_fd, buf, strlen(buf));
+#endif
         }
         close(ffd);
     }
+#ifdef SORT_DIR
+	qsort (filelist, filelist_count, sizeof(struct filelist_t), filelist_compare);
+	int i;
+	for (i=0;i<filelist_count;i++){
+		sprintf(buf, "<tr><td><a href=\"%s\">%s</a></td><td>%s</td><td>%s</td></tr>\n",
+				filelist[i].name, filelist[i].name,filelist[i].timestamp,filelist[i].size);
+		writen(out_fd, buf, strlen(buf));
+	}
+#endif
+
     sprintf(buf, "</table></body></html>");
     writen(out_fd, buf, strlen(buf));
     closedir(d);
@@ -257,7 +303,8 @@ int open_listenfd(int port){
        on any IP address for this host */
     memset(&serveraddr, 0, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
-    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    //serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serveraddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     serveraddr.sin_port = htons((unsigned short)port);
     if (bind(listenfd, (SA *)&serveraddr, sizeof(serveraddr)) < 0)
         return -1;
@@ -309,12 +356,14 @@ int parse_request(int fd, http_request *req){
     }
     char* filename = uri;
     if(uri[0] == '/'){
+        int length;
         filename = uri + 1;
-        int length = strlen(filename);
+        length = strlen(filename);
         if (length == 0){
             filename = ".";
         } else {
-            for (int i = 0; i < length; ++ i) {
+            int i;
+            for (i = 0; i < length; ++ i) {
                 if (filename[i] == '?') {
                     filename[i] = '\0';
                     break;
@@ -342,6 +391,20 @@ void client_error(int fd, int status, char *msg, char *longmsg){
     writen(fd, buf, strlen(buf));
 }
 
+int dosendfile(int out_fd,int in_fd,int sendlen){
+	char buf[2048];
+	int bytes_left=sendlen, bytes_read;
+	while(bytes_left>0){
+		bytes_read=read(in_fd,buf,sizeof(buf));
+		if (bytes_read<=0){
+			break;
+		}
+		writen(out_fd,buf,bytes_read);
+		bytes_left-=bytes_read;
+	}
+	return 0;
+}
+
 void serve_static(int out_fd, int in_fd, http_request *req,
                   uint32_t total_size){
     char buf[256];
@@ -366,7 +429,7 @@ void serve_static(int out_fd, int in_fd, http_request *req,
     while(offset < req->end){
 		off_t sendlen=req->end - req->offset;
 #ifdef __APPLE__
-		if(sendfile(in_fd, out_fd, offset, &sendlen , NULL, 0)<0)
+		if(dosendfile(out_fd,in_fd,sendlen)<0)
 #else
         if(sendfile(out_fd, in_fd, &offset, sendlen) <= 0) 
 #endif
@@ -382,7 +445,7 @@ void serve_static(int out_fd, int in_fd, http_request *req,
 
 void process(int fd, struct sockaddr_in *clientaddr){
     int status = 200; 
-    printf("accept request, fd is %d, pid is %d\n", fd, getpid());
+    tunprintf("tiny: accept request, fd is %d, pid is %d\n", fd, getpid());
     http_request req;
     if (parse_request(fd, &req)<0){
 		status = 400;
@@ -420,36 +483,24 @@ void process(int fd, struct sockaddr_in *clientaddr){
     log_access(status, clientaddr, &req);
 }
 
-int main(int argc, char** argv){
+#if TARGET_OS_IPHONE
+void *tinywebserver(void* arg)
+#else
+int main(int argc, char** argv)
+#endif
+{
+#if TARGET_OS_IPHONE
+	(void *)(arg);
+#endif
     struct sockaddr_in clientaddr;
     int default_port = 9999,
         listenfd,
         connfd;
-    char buf[256];
-    char *path = getcwd(buf, 256);
+	tunprintf("tiny: starting.\n");
     socklen_t clientlen = sizeof clientaddr;
-    if(argc == 2) {
-        if(argv[1][0] >= '0' && argv[1][0] <= '9') {
-            default_port = atoi(argv[1]);
-        } else {
-            path = argv[1];
-            if(chdir(argv[1]) != 0) {
-                perror(argv[1]);
-                exit(1);
-            }
-        }
-    } else if (argc == 3) {
-        default_port = atoi(argv[2]);
-        path = argv[1];
-        if(chdir(argv[1]) != 0) {
-            perror(argv[1]);
-            exit(1);
-        }
-    }
-
     listenfd = open_listenfd(default_port);
     if (listenfd > 0) {
-        printf("listen on port %d, fd is %d\n", default_port, listenfd);
+        tunprintf("tiny: listen on port %d, fd is %d\n", default_port, listenfd);
     } else {
         perror("ERROR");
         exit(listenfd);
@@ -461,8 +512,7 @@ int main(int argc, char** argv){
 	while(1){
 		connfd = accept(listenfd, (SA *)&clientaddr, &clientlen);
 		process(connfd, &clientaddr);
-		dprintf("done processing\n");
+		tunprintf("tiny:done processing\n");
 		close(connfd);
 	}
-    return 0;
 }
