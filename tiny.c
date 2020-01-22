@@ -193,7 +193,7 @@ int filelist_compare (const void * a, const void * b) {
   struct filelist_t *filelistA = (struct filelist_t *)a;
   struct filelist_t *filelistB = (struct filelist_t *)b;
 
-  return (strcmp(filelistB->name , filelistA->name));
+  return (strcmp(filelistB->timestamp, filelistA->timestamp));
 }
 
 #endif
@@ -217,6 +217,7 @@ void handle_directory_request(int out_fd, int dir_fd, char *filename){
     DIR *d = fdopendir(dir_fd);
     struct dirent *dp;
     int ffd;
+	filelist_count=0;
     while ((dp = readdir(d)) != NULL){
         if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")){
             continue;
