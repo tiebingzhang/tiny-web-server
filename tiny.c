@@ -15,9 +15,11 @@
 #include <unistd.h>
 
 
+#define dprintf 
 
 #ifdef __APPLE__
 #include <sys/uio.h>
+#pragma clang diagnostic ignored "-Wunused-value"
 #else
 #include <sys/sendfile.h>
 DIR *fdopendir(int fd);
@@ -173,6 +175,7 @@ void format_size(char* buf, struct stat *stat){
 void handle_directory_request(int out_fd, int dir_fd, char *filename){
     char buf[MAXLINE], m_time[32], size[16];
     struct stat statbuf;
+	dprintf("start handle dir\n");
     sprintf(buf, "HTTP/1.1 200 OK\r\n%s%s%s%s%s",
             "Content-Type: text/html\r\n\r\n",
             "<html><head><style>",
@@ -180,6 +183,11 @@ void handle_directory_request(int out_fd, int dir_fd, char *filename){
             "td {padding: 1.5px 6px;}",
             "</style></head><body><table>\n");
     writen(out_fd, buf, strlen(buf));
+	if (strcmp(filename,".")!=0){
+		sprintf(buf, "<tr><td><a href='..'>[..]</a></td><td></td><td></td></tr>\n");
+		writen(out_fd, buf, strlen(buf));
+	}
+
     DIR *d = fdopendir(dir_fd);
     struct dirent *dp;
     int ffd;
@@ -206,6 +214,7 @@ void handle_directory_request(int out_fd, int dir_fd, char *filename){
     sprintf(buf, "</table></body></html>");
     writen(out_fd, buf, strlen(buf));
     closedir(d);
+	dprintf("done handle dir\n");
 }
 
 static const char* get_mime_type(char *filename){
@@ -274,18 +283,24 @@ void url_decode(char* src, char* dest, int max) {
     *dest = '\0';
 }
 
-void parse_request(int fd, http_request *req){
+int parse_request(int fd, http_request *req){
+	int ret;
     rio_t rio;
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE];
     req->offset = 0;
     req->end = 0;              /* default */
 
+	dprintf("parse request\n");
     rio_readinitb(&rio, fd);
     rio_readlineb(&rio, buf, MAXLINE);
     sscanf(buf, "%s %s", method, uri); /* version is not cared */
     /* read all */
     while(buf[0] != '\n' && buf[1] != '\n') { /* \n || \r\n */
-        rio_readlineb(&rio, buf, MAXLINE);
+        ret=rio_readlineb(&rio, buf, MAXLINE);
+		dprintf("ret=%d --buf=%s--\n",ret,buf);
+		if (ret<=0){
+			return -1;
+		}
         if(buf[0] == 'R' && buf[1] == 'a' && buf[2] == 'n'){
             sscanf(buf, "Range: bytes=%u-%u", &req->offset, &req->end);
             // Range: [start, end]
@@ -308,6 +323,8 @@ void parse_request(int fd, http_request *req){
         }
     }
     url_decode(filename, req->filename, MAXLINE);
+	dprintf("done parse request: filename=%s\n",filename);
+	return 0;
 }
 
 
@@ -364,12 +381,18 @@ void serve_static(int out_fd, int in_fd, http_request *req,
 }
 
 void process(int fd, struct sockaddr_in *clientaddr){
+    int status = 200; 
     printf("accept request, fd is %d, pid is %d\n", fd, getpid());
     http_request req;
-    parse_request(fd, &req);
+    if (parse_request(fd, &req)<0){
+		status = 400;
+		char *msg = "Unknow Error";
+		client_error(fd, status, "Error 1", msg);
+		return;
+	}
 
     struct stat sbuf;
-    int status = 200, ffd = open(req.filename, O_RDONLY, 0);
+	int ffd = open(req.filename, O_RDONLY, 0);
     if(ffd <= 0){
         status = 404;
         char *msg = "File not found";
@@ -438,6 +461,7 @@ int main(int argc, char** argv){
 	while(1){
 		connfd = accept(listenfd, (SA *)&clientaddr, &clientlen);
 		process(connfd, &clientaddr);
+		dprintf("done processing\n");
 		close(connfd);
 	}
     return 0;
